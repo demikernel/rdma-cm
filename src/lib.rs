@@ -96,7 +96,7 @@ impl CmEvent {
         TryFrom::try_from(e).expect("Unable to convert event integer to enum.")
     }
 
-    pub fn get_connection_request_id(&self) -> CommunicationManager {
+    pub fn get_connection_request_id(&self) -> CommunicationManager<true> {
         if self.get_event() != RdmaCmEvent::ConnectionRequest {
             panic!(
                 "{} only makes sense for ConnectRequest event!",
@@ -512,15 +512,14 @@ impl<const RECV_WRS: usize, const SEND_WRS: usize> QueuePair<RECV_WRS, SEND_WRS>
         for (i, (work_id, memory)) in work_requests.enumerate() {
             // Total number of bytes to send.
             let length = (R::memory_size(memory) * std::mem::size_of::<T>()) as u32;
-                sges.push(ffi::ibv_sge {
-                    addr: memory.as_ptr() as u64,
-                    length,
-                    lkey: memory.get_lkey(),
-                });
+            sges.push(ffi::ibv_sge {
+                addr: memory.as_ptr() as u64,
+                length,
+                lkey: memory.get_lkey(),
+            });
 
-            let wr =
-                R::make_work_request(*work_id, &mut sges[i] as *mut _, length <= 512, opcode);
-                requests.push(wr);
+            let wr = R::make_work_request(*work_id, &mut sges[i] as *mut _, length <= 512, opcode);
+            requests.push(wr);
         }
 
         // Link all entries together.
@@ -707,14 +706,14 @@ impl Request for PostRecv {
 }
 
 /// High-level wrapper around an `rdma_cm_id`.
-pub struct CommunicationManager {
+pub struct CommunicationManager<const BLOCKING: bool> {
     cm_id: *mut ffi::rdma_cm_id,
     /// If the CommunicationManager is used for connecting two nodes it needs an event channel.
     /// We keep a reference to it for deallocation.
     event_channel: Option<*mut ffi::rdma_event_channel>,
 }
 
-impl Drop for CommunicationManager {
+impl<const B: bool> Drop for CommunicationManager<B> {
     fn drop(&mut self) {
         debug!("{}", function_name!());
         let ret = unsafe { ffi::rdma_destroy_id(self.cm_id) };
@@ -732,35 +731,96 @@ impl Drop for CommunicationManager {
     }
 }
 
-impl CommunicationManager {
+/// Make a CommunicationManager, which can be either blocking (the default) or nonblocking (by
+/// calling [`Self::async_cm_events`].
+pub struct CommunicationManagerBuilder<const USE_ASYNC: bool>;
+
+impl Default for CommunicationManagerBuilder<false> {
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl CommunicationManagerBuilder<false> {
+    pub fn async_cm_events(self) -> CommunicationManagerBuilder<true> {
+        CommunicationManagerBuilder
+    }
+
+    pub fn build(self) -> Result<CommunicationManager<true>> {
+        CommunicationManager::<true>::new()
+    }
+}
+
+impl CommunicationManagerBuilder<true> {
+    pub fn build(self) -> Result<CommunicationManager<false>> {
+        CommunicationManager::<false>::new()
+    }
+}
+
+fn make_cm_internals() -> Result<(*mut ffi::rdma_cm_id, *mut ffi::rdma_event_channel)> {
+    let event_channel: *mut ffi::rdma_event_channel = unsafe { ffi::rdma_create_event_channel() };
+    if event_channel == null_mut() {
+        return Err(RdmaCmError::RdmaEventChannel(Error::last_os_error()));
+    }
+
+    let mut id: MaybeUninit<*mut ffi::rdma_cm_id> = MaybeUninit::uninit();
+    let ret = unsafe {
+        ffi::rdma_create_id(
+            event_channel,
+            id.as_mut_ptr(),
+            null_mut(),
+            ffi::rdma_port_space_RDMA_PS_TCP,
+        )
+    };
+    if ret == -1 {
+        return Err(RdmaCmError::RdmaCreateId(Error::last_os_error()));
+    }
+
+    Ok((unsafe { id.assume_init() }, event_channel))
+}
+
+impl CommunicationManager<true> {
     pub fn new() -> Result<Self> {
         info!("{}", function_name!());
-
-        let event_channel: *mut ffi::rdma_event_channel =
-            unsafe { ffi::rdma_create_event_channel() };
-        if event_channel == null_mut() {
-            return Err(RdmaCmError::RdmaEventChannel(Error::last_os_error()));
-        }
-
-        let mut id: MaybeUninit<*mut ffi::rdma_cm_id> = MaybeUninit::uninit();
-        let ret = unsafe {
-            ffi::rdma_create_id(
-                event_channel,
-                id.as_mut_ptr(),
-                null_mut(),
-                ffi::rdma_port_space_RDMA_PS_TCP,
-            )
-        };
-        if ret == -1 {
-            return Err(RdmaCmError::RdmaCreateId(Error::last_os_error()));
-        }
-
+        let (cm_id, event_channel) = make_cm_internals()?;
         Ok(CommunicationManager {
-            cm_id: unsafe { id.assume_init() },
+            cm_id,
             event_channel: Some(event_channel),
         })
     }
+}
 
+impl CommunicationManager<false> {
+    /// Make an async CommunicationManager.
+    ///
+    /// Almost all of this crate's api is async: we submit events to rdma-cm and the corresponding operations
+    /// don't block. By default, though, `rdma_get_cm_event` blocks. From the manpage:
+    ///
+    /// man rdma_get_cm_event
+    ///   Retrieves a communication event. If no events are pending, by default, the call will block until an event is received.
+    ///   ...The default synchronous behavior of this routine can be changed by modifying the file descriptor associated with the given channel.
+    ///
+    /// This is exactly what this function does: set `O_NONBLOCK` on the underlying event channel's
+    /// fd, via `fcntl`. Correspondingly, [`get_cm_event`] will return a future which will resolve
+    /// when the event is ready.
+    ///
+    /// This function requires the `async` feature, which is activated by default.
+    #[cfg(feature = "async")]
+    pub fn new() -> Result<CommunicationManager<false>> {
+        let (cm_id, event_channel) = make_cm_internals()?;
+        nix::fcntl::fcntl(
+            unsafe { (*event_channel).fd },
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .map_err(RdmaCmError::Fcntl)?;
+        Ok(CommunicationManager {
+            cm_id,
+            event_channel: Some(event_channel),
+        })
+    }
+}
+
+impl<const BLOCKING: bool> CommunicationManager<BLOCKING> {
     /// Convenience method for accessing context and checkingn nullness. Used by other methods.
     fn get_raw_verbs_context(&self) -> *mut ffi::ibv_context {
         // Safety: always safe. Our API guarantees dereferencing `cm_id` will always be valid.
@@ -800,7 +860,7 @@ impl CommunicationManager {
             return Err(RdmaCmError::CreateCompletionQueue(Error::last_os_error()));
         }
 
-        Ok(CompletionQueue { cq})
+        Ok(CompletionQueue { cq })
     }
 
     pub fn create_qp<const RQ_SIZE: usize, const SQ_SIZE: usize, const CQ_SIZE: usize>(
@@ -1003,6 +1063,19 @@ impl CommunicationManager {
         Ok(())
     }
 
+    pub fn disconnect(&self) -> Result<()> {
+        info!("{}", function_name!());
+
+        let ret = unsafe { ffi::rdma_disconnect(self.cm_id) };
+        if ret == -1 {
+            return Err(RdmaCmError::Disconnect(Error::last_os_error()));
+        }
+
+        Ok(())
+    }
+}
+
+impl CommunicationManager<true> {
     pub fn get_cm_event(&self) -> Result<CmEvent> {
         info!("{}", function_name!());
 
@@ -1015,16 +1088,70 @@ impl CommunicationManager {
             event: unsafe { cm_events.assume_init() },
         })
     }
+}
 
-    pub fn disconnect(&self) -> Result<()> {
+#[cfg(feature = "async")]
+impl CommunicationManager<false> {
+    pub fn get_cm_event(&self) -> get_cm_event_async::GetCmEventFuture {
         info!("{}", function_name!());
+        get_cm_event_async::GetCmEventFuture::new(unsafe { (*self.cm_id).channel })
+    }
+}
 
-        let ret = unsafe { ffi::rdma_disconnect(self.cm_id) };
-        if ret == -1 {
-            return Err(RdmaCmError::Disconnect(Error::last_os_error()));
+#[cfg(feature = "async")]
+mod get_cm_event_async {
+    use super::{ffi, CmEvent, Error, MaybeUninit, Result};
+    use crate::RdmaCmError;
+    use std::{
+        future::Future,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::unix::AsyncFd;
+
+    struct EventChannel(*mut ffi::rdma_event_channel);
+
+    impl std::os::unix::io::AsRawFd for EventChannel {
+        fn as_raw_fd(&self) -> std::os::unix::prelude::RawFd {
+            unsafe { (*self.0).fd }
         }
+    }
 
-        Ok(())
+    pub struct GetCmEventFuture {
+        cm_events: MaybeUninit<*mut ffi::rdma_cm_event>,
+        channel: Option<AsyncFd<EventChannel>>,
+    }
+
+    impl GetCmEventFuture {
+        pub fn new(channel: *mut ffi::rdma_event_channel) -> Self {
+            GetCmEventFuture {
+                cm_events: MaybeUninit::uninit(),
+                channel: Some(AsyncFd::new(EventChannel(channel)).expect("make asyncfd")),
+            }
+        }
+    }
+
+    impl Future for GetCmEventFuture {
+        type Output = Result<CmEvent>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            match self.channel.as_ref().unwrap().poll_read_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(mut x)) => {
+                    x.clear_ready();
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(RdmaCmError::GetCmEvent(e))),
+            }
+
+            let channel = self.channel.take().unwrap().into_inner().0;
+            let ret = unsafe { ffi::rdma_get_cm_event(channel, self.cm_events.as_mut_ptr()) };
+            if ret == -1 {
+                return Poll::Ready(Err(RdmaCmError::GetCmEvent(Error::last_os_error())));
+            }
+            Poll::Ready(Ok(CmEvent {
+                event: unsafe { self.cm_events.assume_init() },
+            }))
+        }
     }
 }
 

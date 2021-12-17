@@ -33,6 +33,8 @@ pub enum RdmaCmError {
     RdmaEventChannel(std::io::Error),
     #[error("Unable to create RDMA Device ID.")]
     RdmaCreateId(std::io::Error),
+    #[error("Unable to set O_NONBLOCK on event channel.")]
+    Fcntl(nix::errno::Errno),
     #[error("Unable to disconnect RDMA connction.")]
     Disconnect(std::io::Error),
 }
